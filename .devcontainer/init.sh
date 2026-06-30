@@ -1,0 +1,1 @@
+curl -fsSL https://raw.githubusercontent.com/supabase/cli/main/install | bash
