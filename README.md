@@ -29,7 +29,22 @@ Workspace (resource)
         └── Document (resource)
 ```
 
-When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children. The **first matching rule wins**; if no rule is found anywhere, the result is **DENY**.
+When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children.
+
+**Precedence** is determined first by principal specificity, then by resource specificity. A permission attached to a more specific principal always overrides one attached to an ancestor principal, regardless of resource specificity. Within the same principal, the most specific resource wins. If no rule is found anywhere, the result is **DENY**.
+
+| Priority | Principal | Resource |
+| --- | --- | --- |
+| 1 | Exact | Exact |
+| 2 | Exact | Parent |
+| 3 | Exact | Grandparent … |
+| 4 | Parent | Exact |
+| 5 | Parent | Parent |
+| 6 | Parent | Grandparent … |
+| 7 | Grandparent | Exact |
+| … | … | … |
+
+This is the order the engine evaluates candidates: it exhausts the full resource hierarchy for the current principal before moving one level up the principal hierarchy.
 
 ---
 
