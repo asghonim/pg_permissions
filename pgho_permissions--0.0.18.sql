@@ -15,7 +15,6 @@ BEGIN
     RETURN encode(uuid_bytes, 'hex')::uuid;
 END;
 $$ LANGUAGE plpgsql VOLATILE SET search_path = '';
-REVOKE EXECUTE ON FUNCTION @extschema@.gen_uuid_v7() FROM public;
 
 -- ---------------------------------------------------------------------------
 -- Resources
@@ -28,7 +27,7 @@ CREATE TABLE @extschema@.resources (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     uid              UUID        NOT NULL UNIQUE DEFAULT @extschema@.gen_uuid_v7(),
     resource_type    TEXT        NOT NULL CHECK (char_length(resource_type) BETWEEN 1 AND 100),
-    resource_uuid    UUID,
+    resource_uuid    UUID        NOT NULL,
     parent_id        BIGINT      REFERENCES @extschema@.resources(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (resource_type, resource_uuid)
@@ -42,7 +41,7 @@ CREATE TABLE @extschema@.principals (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     uid              UUID        NOT NULL UNIQUE DEFAULT @extschema@.gen_uuid_v7(),
     principal_type   TEXT        NOT NULL CHECK (char_length(principal_type) BETWEEN 1 AND 100),
-    principal_uuid   UUID,
+    principal_uuid   UUID        NOT NULL,
     parent_id        BIGINT      REFERENCES @extschema@.principals(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (principal_type, principal_uuid)
@@ -369,10 +368,12 @@ CREATE OR REPLACE FUNCTION @extschema@.principal(p_principal_type TEXT, p_princi
   LANGUAGE plpgsql
   AS $$
   BEGIN
+      IF p_principal_uuid IS NULL THEN
+          RAISE EXCEPTION 'principal_uuid must not be NULL';
+      END IF;
       RETURN (SELECT id FROM @extschema@.principals WHERE principal_type = p_principal_type AND principal_uuid = p_principal_uuid LIMIT 1);
   END;
   $$;
-  REVOKE EXECUTE ON FUNCTION @extschema@.principal(TEXT, UUID) FROM public;
 
 CREATE OR REPLACE FUNCTION @extschema@.role(p_role_name TEXT)
   RETURNS BIGINT
@@ -383,7 +384,6 @@ CREATE OR REPLACE FUNCTION @extschema@.role(p_role_name TEXT)
       RETURN (SELECT id FROM @extschema@.roles WHERE role_name = p_role_name LIMIT 1);
   END;
   $$;
-  REVOKE EXECUTE ON FUNCTION @extschema@.role(TEXT) FROM public;
 
 
 CREATE OR REPLACE FUNCTION @extschema@.resource(p_resource_type TEXT, p_resource_uuid UUID)
@@ -392,10 +392,12 @@ CREATE OR REPLACE FUNCTION @extschema@.resource(p_resource_type TEXT, p_resource
   LANGUAGE plpgsql
   AS $$
   BEGIN
+      IF p_resource_uuid IS NULL THEN
+          RAISE EXCEPTION 'resource_uuid must not be NULL';
+      END IF;
       RETURN (SELECT id FROM @extschema@.resources WHERE resource_type = p_resource_type AND resource_uuid = p_resource_uuid LIMIT 1);
   END;
   $$;
-  REVOKE EXECUTE ON FUNCTION @extschema@.resource(TEXT, UUID) FROM public;
 
 
 CREATE OR REPLACE FUNCTION @extschema@.action(p_action_name TEXT)

@@ -193,7 +193,7 @@ This diagram shows how the core tables relate to one another and how self-refere
 |   roles    |            |    |  actions   |             |
 +------------+            |    +------------+             |
 | PK | id    |            |    | PK | id    |             |
-|    | name  |            |    |    | name  |             |
+|    | role_name  |       |    |    | action_name  |        |
 +------------+            |    +------------+             |
                           |                               v
                           |                   +-----------------------+
@@ -427,9 +427,9 @@ Suppose you want to give an admin `OWNER` on *every* resource — across every t
 The idiomatic solution is to make every resource hierarchy rooted at a single synthetic **root resource**. The root is a normal row in `resources`; it just has no `parent_id` and no corresponding domain object.
 
 ```sql
--- Create the root resource once (no resource_uuid needed)
+-- Create the root resource once (pick a stable UUID and reuse it everywhere)
 INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
-VALUES ('root', NULL, NULL);
+VALUES ('root', '00000000-0000-0000-0000-000000000000', NULL);
 ```
 
 Every other top-level resource then becomes a child of root:
@@ -437,7 +437,7 @@ Every other top-level resource then becomes a child of root:
 ```sql
 -- Tenant A hangs off the root
 INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
-VALUES ('tenant', '<tenant-a-uuid>', pgho_permissions.resource('root', NULL));
+VALUES ('tenant', '<tenant-a-uuid>', pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000'));
 ```
 
 This gives you a single tree that looks like:
@@ -459,7 +459,7 @@ INSERT INTO pgho_permissions.role_permissions (principal_id, role_id, resource_i
 VALUES (
     pgho_permissions.principal('user',  '<admin-uuid>'),
     pgho_permissions.role('owner'),
-    pgho_permissions.resource('root', NULL)
+    pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000')
 );
 ```
 
@@ -480,13 +480,13 @@ Exactly as today. Nothing changes.
 You can introduce intermediate synthetic roots to scope a global grant to one resource type without affecting others:
 
 ```sql
--- A synthetic node that groups all projects
+-- A synthetic node that groups all projects (pick a stable UUID for each synthetic root)
 INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
-VALUES ('projects_root', NULL, pgho_permissions.resource('root', NULL));
+VALUES ('projects_root', '00000000-0000-0000-0000-000000000001', pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000'));
 
 -- All projects hang off it
 UPDATE pgho_permissions.resources
-SET parent_id = pgho_permissions.resource('projects_root', NULL)
+SET parent_id = pgho_permissions.resource('projects_root', '00000000-0000-0000-0000-000000000001')
 WHERE resource_type = 'project';
 ```
 
