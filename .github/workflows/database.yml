@@ -12,5 +12,4 @@ jobs:
         with:
           version: latest
       - run: supabase db start
-      - run: supabase db reset --force
       - run: supabase test db
