@@ -487,3 +487,10 @@ GRANT USAGE, CREATE ON SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA @extschema@ TO service_role;
+
+GRANT USAGE ON SCHEMA pgho_permissions TO authenticated;
+GRANT EXECUTE ON FUNCTION pgho_permissions.principal(TEXT, UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION pgho_permissions.role(TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION pgho_permissions.resource(TEXT, UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION pgho_permissions.has_role_permission(BIGINT, BIGINT, BIGINT) TO authenticated;
+GRANT EXECUTE ON FUNCTION pgho_permissions.has_action_permission(BIGINT, BIGINT, BIGINT) TO authenticated;

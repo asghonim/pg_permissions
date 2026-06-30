@@ -20,7 +20,7 @@ DROP SCHEMA     IF EXISTS pgho_permissions;
 CREATE SCHEMA   IF NOT EXISTS pgho_permissions;
 CREATE EXTENSION IF NOT EXISTS "asghonim@pgho_permissions"
   SCHEMA pgho_permissions
-  VERSION '0.0.18';
+  VERSION '0.0.19';
 ```
 
 You can substitute any schema name you prefer for `pgho_permissions`.
