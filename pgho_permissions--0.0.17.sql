@@ -52,81 +52,261 @@ CREATE INDEX idx_principals_parent ON @extschema@.principals(parent_id) WHERE pa
 ALTER TABLE @extschema@.principals ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE @extschema@.principals TO service_role;
 
--- Cycle detection: walk from the proposed parent up through its ancestors;
--- if we reach NEW.id the new parent_id would close a loop.
+-- ---------------------------------------------------------------------------
+-- Closure tables
+-- Materialise every ancestor/descendant pair with its hop distance.
+-- Maintained automatically by triggers; never written by application code.
+-- ---------------------------------------------------------------------------
+CREATE TABLE @extschema@.resource_closure (
+    ancestor_id   BIGINT NOT NULL REFERENCES @extschema@.resources(id)  ON DELETE CASCADE,
+    descendant_id BIGINT NOT NULL REFERENCES @extschema@.resources(id)  ON DELETE CASCADE,
+    depth         INT    NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (ancestor_id, descendant_id)
+    );
+-- Covering index for the "give me all ancestors of X" lookup in permission queries
+CREATE INDEX idx_resource_closure_descendant ON @extschema@.resource_closure(descendant_id);
+ALTER TABLE @extschema@.resource_closure ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE @extschema@.resource_closure TO service_role;
+
+CREATE TABLE @extschema@.principal_closure (
+    ancestor_id   BIGINT NOT NULL REFERENCES @extschema@.principals(id) ON DELETE CASCADE,
+    descendant_id BIGINT NOT NULL REFERENCES @extschema@.principals(id) ON DELETE CASCADE,
+    depth         INT    NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (ancestor_id, descendant_id)
+    );
+CREATE INDEX idx_principal_closure_descendant ON @extschema@.principal_closure(descendant_id);
+ALTER TABLE @extschema@.principal_closure ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE @extschema@.principal_closure TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- Resource closure triggers
+-- ---------------------------------------------------------------------------
+
+-- INSERT: add self-row and connect to existing ancestors through the parent.
 CREATE OR REPLACE FUNCTION @extschema@.on_insert_resource()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = @extschema@
 AS $$
-DECLARE
-    v_walk BIGINT;
 BEGIN
-    IF NEW.parent_id IS NULL THEN
-        RETURN NEW;
+    INSERT INTO @extschema@.resource_closure (ancestor_id, descendant_id, depth)
+    VALUES (NEW.id, NEW.id, 0);
+
+    IF NEW.parent_id IS NOT NULL THEN
+        INSERT INTO @extschema@.resource_closure (ancestor_id, descendant_id, depth)
+        SELECT ancestor_id, NEW.id, depth + 1
+        FROM   @extschema@.resource_closure
+        WHERE  descendant_id = NEW.parent_id;
     END IF;
-
-    IF NEW.parent_id = NEW.id THEN
-        RAISE EXCEPTION 'resource % cannot be its own parent', NEW.id;
-    END IF;
-
-    v_walk := NEW.parent_id;
-    WHILE v_walk IS NOT NULL LOOP
-        SELECT parent_id INTO v_walk
-        FROM @extschema@.resources
-        WHERE id = v_walk;
-
-        IF v_walk = NEW.id THEN
-            RAISE EXCEPTION
-                'setting parent_id = % on resource % would create a cycle in the resource hierarchy',
-                NEW.parent_id, NEW.id;
-        END IF;
-    END LOOP;
 
     RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER on_insert_resource
-    BEFORE INSERT OR UPDATE OF parent_id ON @extschema@.resources
+    AFTER INSERT ON @extschema@.resources
     FOR EACH ROW EXECUTE FUNCTION @extschema@.on_insert_resource();
+
+-- UPDATE OF parent_id: cycle-check, then re-graft the subtree.
+CREATE OR REPLACE FUNCTION @extschema@.on_reparent_resource()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+BEGIN
+    IF OLD.parent_id IS NOT DISTINCT FROM NEW.parent_id THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.parent_id IS NOT NULL THEN
+        IF NEW.parent_id = NEW.id THEN
+            RAISE EXCEPTION 'resource % cannot be its own parent', NEW.id;
+        END IF;
+
+        -- New parent must not already be a descendant of this node
+        IF EXISTS (
+            SELECT 1
+            FROM   @extschema@.resource_closure
+            WHERE  ancestor_id   = NEW.id
+              AND  descendant_id = NEW.parent_id
+              AND  depth > 0
+        ) THEN
+            RAISE EXCEPTION
+                'setting parent_id = % on resource % would create a cycle in the resource hierarchy',
+                NEW.parent_id, NEW.id;
+        END IF;
+    END IF;
+
+    -- Remove all ancestry edges that enter the subtree from outside it
+    DELETE FROM @extschema@.resource_closure
+    WHERE  descendant_id IN (
+               SELECT descendant_id
+               FROM   @extschema@.resource_closure
+               WHERE  ancestor_id = NEW.id          -- subtree including self
+           )
+      AND  ancestor_id NOT IN (
+               SELECT descendant_id
+               FROM   @extschema@.resource_closure
+               WHERE  ancestor_id = NEW.id          -- same subtree
+           );
+
+    -- Graft new ancestry edges from the new parent's ancestors to every
+    -- node in the subtree.  +1 accounts for the new parent→node edge.
+    IF NEW.parent_id IS NOT NULL THEN
+        INSERT INTO @extschema@.resource_closure (ancestor_id, descendant_id, depth)
+        SELECT p.ancestor_id, c.descendant_id, p.depth + 1 + c.depth
+        FROM   @extschema@.resource_closure p
+        JOIN   @extschema@.resource_closure c ON c.ancestor_id = NEW.id
+        WHERE  p.descendant_id = NEW.parent_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_reparent_resource
+    AFTER UPDATE OF parent_id ON @extschema@.resources
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_reparent_resource();
+
+-- DELETE: detach the subtree before ON DELETE CASCADE removes the node's own rows.
+-- Children will become roots (ON DELETE SET NULL on resources.parent_id).
+-- Their ancestry rows that passed through the deleted node must be removed here
+-- because CASCADE only cleans up rows that directly name OLD.id.
+CREATE OR REPLACE FUNCTION @extschema@.on_delete_resource()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+BEGIN
+    DELETE FROM @extschema@.resource_closure
+    WHERE  descendant_id IN (
+               SELECT descendant_id
+               FROM   @extschema@.resource_closure
+               WHERE  ancestor_id = OLD.id AND depth > 0
+           )
+      AND  ancestor_id IN (
+               SELECT ancestor_id
+               FROM   @extschema@.resource_closure
+               WHERE  descendant_id = OLD.id
+           );
+
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER on_delete_resource
+    BEFORE DELETE ON @extschema@.resources
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_delete_resource();
+
+-- ---------------------------------------------------------------------------
+-- Principal closure triggers  (mirror of resource triggers)
+-- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION @extschema@.on_insert_principal()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SET search_path = @extschema@
 AS $$
-DECLARE
-    v_walk BIGINT;
 BEGIN
-    IF NEW.parent_id IS NULL THEN
-        RETURN NEW;
+    INSERT INTO @extschema@.principal_closure (ancestor_id, descendant_id, depth)
+    VALUES (NEW.id, NEW.id, 0);
+
+    IF NEW.parent_id IS NOT NULL THEN
+        INSERT INTO @extschema@.principal_closure (ancestor_id, descendant_id, depth)
+        SELECT ancestor_id, NEW.id, depth + 1
+        FROM   @extschema@.principal_closure
+        WHERE  descendant_id = NEW.parent_id;
     END IF;
-
-    IF NEW.parent_id = NEW.id THEN
-        RAISE EXCEPTION 'principal % cannot be its own parent', NEW.id;
-    END IF;
-
-    v_walk := NEW.parent_id;
-    WHILE v_walk IS NOT NULL LOOP
-        SELECT parent_id INTO v_walk
-        FROM @extschema@.principals
-        WHERE id = v_walk;
-
-        IF v_walk = NEW.id THEN
-            RAISE EXCEPTION
-                'setting parent_id = % on principal % would create a cycle in the principal hierarchy',
-                NEW.parent_id, NEW.id;
-        END IF;
-    END LOOP;
 
     RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER on_insert_principal
-    BEFORE INSERT OR UPDATE OF parent_id ON @extschema@.principals
+    AFTER INSERT ON @extschema@.principals
     FOR EACH ROW EXECUTE FUNCTION @extschema@.on_insert_principal();
+
+CREATE OR REPLACE FUNCTION @extschema@.on_reparent_principal()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+BEGIN
+    IF OLD.parent_id IS NOT DISTINCT FROM NEW.parent_id THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.parent_id IS NOT NULL THEN
+        IF NEW.parent_id = NEW.id THEN
+            RAISE EXCEPTION 'principal % cannot be its own parent', NEW.id;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM   @extschema@.principal_closure
+            WHERE  ancestor_id   = NEW.id
+              AND  descendant_id = NEW.parent_id
+              AND  depth > 0
+        ) THEN
+            RAISE EXCEPTION
+                'setting parent_id = % on principal % would create a cycle in the principal hierarchy',
+                NEW.parent_id, NEW.id;
+        END IF;
+    END IF;
+
+    DELETE FROM @extschema@.principal_closure
+    WHERE  descendant_id IN (
+               SELECT descendant_id
+               FROM   @extschema@.principal_closure
+               WHERE  ancestor_id = NEW.id
+           )
+      AND  ancestor_id NOT IN (
+               SELECT descendant_id
+               FROM   @extschema@.principal_closure
+               WHERE  ancestor_id = NEW.id
+           );
+
+    IF NEW.parent_id IS NOT NULL THEN
+        INSERT INTO @extschema@.principal_closure (ancestor_id, descendant_id, depth)
+        SELECT p.ancestor_id, c.descendant_id, p.depth + 1 + c.depth
+        FROM   @extschema@.principal_closure p
+        JOIN   @extschema@.principal_closure c ON c.ancestor_id = NEW.id
+        WHERE  p.descendant_id = NEW.parent_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_reparent_principal
+    AFTER UPDATE OF parent_id ON @extschema@.principals
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_reparent_principal();
+
+CREATE OR REPLACE FUNCTION @extschema@.on_delete_principal()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+BEGIN
+    DELETE FROM @extschema@.principal_closure
+    WHERE  descendant_id IN (
+               SELECT descendant_id
+               FROM   @extschema@.principal_closure
+               WHERE  ancestor_id = OLD.id AND depth > 0
+           )
+      AND  ancestor_id IN (
+               SELECT ancestor_id
+               FROM   @extschema@.principal_closure
+               WHERE  descendant_id = OLD.id
+           );
+
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER on_delete_principal
+    BEFORE DELETE ON @extschema@.principals
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_delete_principal();
 
 CREATE TABLE @extschema@.roles (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -153,33 +333,33 @@ GRANT ALL ON TABLE @extschema@.actions TO service_role;
 CREATE TABLE @extschema@.action_permissions (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     uid              UUID        NOT NULL UNIQUE DEFAULT @extschema@.gen_uuid_v7(),
-    resource_id      BIGINT      REFERENCES @extschema@.resources(id) ON DELETE CASCADE,
-    principal_id     BIGINT      REFERENCES @extschema@.principals(id) ON DELETE CASCADE,
-    action_id        BIGINT      REFERENCES @extschema@.actions(id) ON DELETE CASCADE,
+    resource_id      BIGINT      REFERENCES @extschema@.resources(id)   ON DELETE CASCADE,
+    principal_id     BIGINT      REFERENCES @extschema@.principals(id)  ON DELETE CASCADE,
+    action_id        BIGINT      REFERENCES @extschema@.actions(id)     ON DELETE CASCADE,
     access           TEXT        NOT NULL CHECK (access IN ('ALLOW', 'DENY')),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (resource_id, principal_id, action_id)
     );
-CREATE INDEX idx_action_permissions_resource ON @extschema@.action_permissions(resource_id);
+CREATE INDEX idx_action_permissions_resource  ON @extschema@.action_permissions(resource_id);
 CREATE INDEX idx_action_permissions_principal ON @extschema@.action_permissions(principal_id);
-CREATE INDEX idx_action_permissions_action ON @extschema@.action_permissions(action_id);
-CREATE INDEX idx_action_permissions_all ON @extschema@.action_permissions(principal_id, action_id, resource_id);
+CREATE INDEX idx_action_permissions_action    ON @extschema@.action_permissions(action_id);
+CREATE INDEX idx_action_permissions_all       ON @extschema@.action_permissions(principal_id, action_id, resource_id);
 ALTER TABLE @extschema@.action_permissions ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE @extschema@.action_permissions TO service_role;
 
 CREATE TABLE @extschema@.role_permissions (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     uid              UUID        NOT NULL UNIQUE DEFAULT @extschema@.gen_uuid_v7(),
-    resource_id      BIGINT      REFERENCES @extschema@.resources(id) ON DELETE CASCADE,
-    role_id          BIGINT      REFERENCES @extschema@.roles(id) ON DELETE CASCADE,
-    principal_id     BIGINT      REFERENCES @extschema@.principals(id) ON DELETE CASCADE,
+    resource_id      BIGINT      REFERENCES @extschema@.resources(id)   ON DELETE CASCADE,
+    role_id          BIGINT      REFERENCES @extschema@.roles(id)       ON DELETE CASCADE,
+    principal_id     BIGINT      REFERENCES @extschema@.principals(id)  ON DELETE CASCADE,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (resource_id, role_id, principal_id)
     );
-CREATE INDEX idx_role_permissions_resource ON @extschema@.role_permissions(resource_id);
-CREATE INDEX idx_role_permissions_role ON @extschema@.role_permissions(role_id);
+CREATE INDEX idx_role_permissions_resource  ON @extschema@.role_permissions(resource_id);
+CREATE INDEX idx_role_permissions_role      ON @extschema@.role_permissions(role_id);
 CREATE INDEX idx_role_permissions_principal ON @extschema@.role_permissions(principal_id);
-CREATE INDEX idx_role_permissions_all ON @extschema@.role_permissions(principal_id, role_id, resource_id);
+CREATE INDEX idx_role_permissions_all       ON @extschema@.role_permissions(principal_id, role_id, resource_id);
 ALTER TABLE @extschema@.role_permissions ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE @extschema@.role_permissions TO service_role;
 
@@ -230,121 +410,61 @@ CREATE OR REPLACE FUNCTION @extschema@.action(p_action_name TEXT)
   REVOKE EXECUTE ON FUNCTION @extschema@.action(TEXT) FROM public;
 
 
+-- ---------------------------------------------------------------------------
+-- Permission checks
+-- Both functions resolve the full ancestor set for the given principal and
+-- resource via the closure tables (single join, no loops), then pick the
+-- most-specific matching rule ordered by principal proximity first, resource
+-- proximity second — preserving the same precedence as the former loop-based
+-- implementation.
+-- ---------------------------------------------------------------------------
+
 CREATE OR REPLACE FUNCTION @extschema@.has_action_permission(
     p_principal_id BIGINT,
     p_action_id    BIGINT,
     p_resource_id  BIGINT
   )
   RETURNS BOOLEAN
-  LANGUAGE plpgsql
+  LANGUAGE sql
   STABLE
-  SECURITY DEFINER 
+  SECURITY DEFINER
   SET search_path = @extschema@
   AS $$
-  DECLARE
-      v_principal_id BIGINT;
-      v_resource_id  BIGINT;
-      v_access       TEXT;
-  BEGIN
-      -- Walk up the principal hierarchy (outer loop)
-      v_principal_id := p_principal_id;
-      WHILE v_principal_id IS NOT NULL LOOP
-
-          -- For this principal, walk up the resource hierarchy (inner loop)
-          v_resource_id := p_resource_id;
-          WHILE v_resource_id IS NOT NULL LOOP
-
-              SELECT sp.access
-              INTO   v_access
-              FROM   @extschema@.action_permissions sp
-              WHERE  sp.principal_id = v_principal_id
-              AND    sp.action_id    = p_action_id
-              AND    sp.resource_id  = v_resource_id
-              LIMIT  1;
-
-              -- First defined permission wins
-              IF FOUND THEN
-                  RETURN v_access = 'ALLOW';
-              END IF;
-
-              -- Step one level up the resource hierarchy
-              SELECT r.parent_id
-              INTO   v_resource_id
-              FROM   @extschema@.resources r
-              WHERE  r.id = v_resource_id;
-
-          END LOOP;
-
-          -- Resource hierarchy exhausted: step up the principal hierarchy
-          SELECT p.parent_id
-          INTO   v_principal_id
-          FROM   @extschema@.principals p
-          WHERE  p.id = v_principal_id;
-
-      END LOOP;
-
-      -- No permission found anywhere: default DENY
-      RETURN FALSE;
-  END;
+    SELECT COALESCE(
+        (SELECT ap.access = 'ALLOW'
+         FROM   action_permissions  ap
+         JOIN   principal_closure   pc ON pc.ancestor_id = ap.principal_id
+         JOIN   resource_closure    rc ON rc.ancestor_id = ap.resource_id
+         WHERE  pc.descendant_id = p_principal_id
+           AND  rc.descendant_id = p_resource_id
+           AND  ap.action_id     = p_action_id
+         ORDER BY pc.depth ASC, rc.depth ASC
+         LIMIT 1),
+        FALSE
+    );
   $$;
 
 
 CREATE OR REPLACE FUNCTION @extschema@.has_role_permission(
     p_principal_id BIGINT,
-    p_role_id    BIGINT,
+    p_role_id      BIGINT,
     p_resource_id  BIGINT
   )
   RETURNS BOOLEAN
-  LANGUAGE plpgsql
+  LANGUAGE sql
   STABLE
-  SECURITY DEFINER 
+  SECURITY DEFINER
   SET search_path = @extschema@
   AS $$
-  DECLARE
-      v_principal_id BIGINT;
-      v_resource_id  BIGINT;
-      v_access       TEXT;
-  BEGIN
-      -- Walk up the principal hierarchy (outer loop)
-      v_principal_id := p_principal_id;
-      WHILE v_principal_id IS NOT NULL LOOP
-
-          -- For this principal, walk up the resource hierarchy (inner loop)
-          v_resource_id := p_resource_id;
-          WHILE v_resource_id IS NOT NULL LOOP
-            
-              SELECT 1
-              INTO   v_access
-              FROM   @extschema@.role_permissions rp
-              WHERE  rp.principal_id = v_principal_id
-              AND    rp.role_id    = p_role_id
-              AND    rp.resource_id  = v_resource_id
-              LIMIT  1;
-
-              -- First defined permission wins
-              IF FOUND THEN
-                  RETURN TRUE;
-              END IF;
-
-              -- Step one level up the resource hierarchy
-              SELECT r.parent_id
-              INTO   v_resource_id
-              FROM   @extschema@.resources r
-              WHERE  r.id = v_resource_id;
-
-          END LOOP;
-
-          -- Resource hierarchy exhausted: step up the principal hierarchy
-          SELECT p.parent_id
-          INTO   v_principal_id
-          FROM   @extschema@.principals p
-          WHERE  p.id = v_principal_id;
-
-      END LOOP;
-
-      -- No permission found anywhere: default DENY
-      RETURN FALSE;
-  END;
+    SELECT EXISTS (
+        SELECT 1
+        FROM   role_permissions   rp
+        JOIN   principal_closure  pc ON pc.ancestor_id = rp.principal_id
+        JOIN   resource_closure   rc ON rc.ancestor_id = rp.resource_id
+        WHERE  pc.descendant_id = p_principal_id
+          AND  rc.descendant_id = p_resource_id
+          AND  rp.role_id       = p_role_id
+    );
   $$;
 
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ FROM public;
