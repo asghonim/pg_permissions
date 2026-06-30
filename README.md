@@ -162,6 +162,87 @@ GRANT SELECT ON public.documents TO authenticated;
 | **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
 | **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
 
+This diagram shows how the core tables relate to one another and how self-referencing foreign keys (parent_id) build the hierarchical trees for both principals and resources.
+
+```
+                   +-----------------------+
+                   |       principals      |
+                   +-----------------------+
+                   | PK | id               | <----+
+                   |    | principal_type   |      | parent_id
+                   |    | principal_uuid   | -----+
+                   | FK | parent_id        |
+                   +-----------------------+
+                     ^                   ^
+                     |                   |
+                     | principal_id      | principal_id
+                     |                   |
+    +-----------------------+     +---------------------------+
+    |    role_permissions   |     |    action_permissions     |
+    +-----------------------+     +---------------------------+
+    | PK | id               |     | PK | id                   |
+    | FK | principal_id     |     | FK | principal_id         |
+    | FK | role_id          |     | FK | action_id            |
+    | FK | resource_id      |     | FK | resource_id          |
+    +-----------------------+     |    | access (ALLOW/DENY)  |
+      |                   |       +---------------------------+
+      |                   |          |                    |
+      | role_id           |          | action_id          |
+      v                   |          v                    |
++------------+            |    +------------+             | resource_id
+|   roles    |            |    |  actions   |             |
++------------+            |    +------------+             |
+| PK | id    |            |    | PK | id    |             |
+|    | name  |            |    |    | name  |             |
++------------+            |    +------------+             |
+                          |                               v
+                          |                   +-----------------------+
+                          |                   |       resources       |
+                          |                   +-----------------------+
+                          |                   | PK | id               | <----+
+                          +-----------------> |    | resource_type   |      | parent_id
+                                              |    | resource_uuid   | -----+
+                                              | FK | parent_id        |
+                                              +-----------------------+
+```
+
+When has_role_permission or has_action_permission is invoked, the engine executes a nested tree-walk. It searches the resource tree first for the current principal before stepping up to the parent principal. This is a simplified diagram of the search process. The actual implementation is a single SQL query with two index joins, but the logic is easier to visualize as a flowchart:
+
+```
+             [ Start Search ]
+       (Current Principal = Input Principal)
+                 |
+                 v
+     +---> [ Reset Resource Walk ] <--------------------------+
+     |     (Current Resource = Input Resource)                |
+     |           |                                            |
+     |           v                                            |
+     |     Is there a rule matching                           |
+     |   (Current Principal, Current Resource)?               |
+     |         /           \                                  |
+     |       YES            NO                                |
+     |       /               \                                |
+     |      v                 v                               |
+     |  [ RETURN RULE ]     Does Current Resource             |
+     |  (ALLOW or DENY)     have a parent_id?                 |
+     |                        /           \                   |
+     |                      YES            NO                 |
+     |                      /               \                 |
+     |                     v                 v                |
+     |             [ Move Up Resource ]    Does Current       |
+     |             Current Resource =      Principal have     |
+     |             resource.parent_id      a parent_id?       |
+     |                     |                 /          \     |
+     |                     +--> (Loop)     YES           NO   |
+     |                                     /              \   |
+     |                                    v                v  |
+     |                             [ Move Up Principal ] [ RETURN FALSE ]
+     |                             Current Principal =    (Default Deny)
+     |                             principal.parent_id
+     |                                    |
+     +------------------------------------+
+```
+
 ### Roles and actions are opaque
 
 The extension treats roles and actions as **plain names**. A role has no intrinsic meaning beyond its string identifier — the extension does not know what `tenant_admin` implies, whether roles subsume actions, or whether one role outranks another. The same is true for actions: `delete` is just a label.
