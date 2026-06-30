@@ -15,6 +15,66 @@ Built with Supabase in mind: all tables have RLS enabled, lookup functions run a
 | **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
 | **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
 
+### Roles and actions are opaque
+
+The extension treats roles and actions as **plain names**. A role has no intrinsic meaning beyond its string identifier — the extension does not know what `tenant_admin` implies, whether roles subsume actions, or whether one role outranks another. The same is true for actions: `delete` is just a label.
+
+All semantics are **application-defined**. Your RLS policies are the place where meaning is assigned:
+
+```sql
+-- The application decides that holding "tenant_admin" means you may SELECT tenants.
+CREATE POLICY "SELECT tenants"
+  ON public.tenants FOR SELECT
+  USING (
+    pgho_permissions.has_role_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.role('tenant_admin'),
+      pgho_permissions.resource('tenant', uid)
+    )
+  );
+
+-- The application decides that holding "write" access to a document means you may UPDATE it.
+CREATE POLICY "UPDATE documents"
+  ON public.documents FOR UPDATE
+  USING (
+    pgho_permissions.has_action_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.action('write'),
+      pgho_permissions.resource('document', uid)
+    )
+  );
+```
+
+Whether a role implies certain actions, whether roles and actions coexist on the same resource, and how types like `user` or `tenant` map to your schema — all of that is up to you. The extension only answers "does this principal hold this role/action on this resource (or an ancestor)?"
+
+The **relationship between roles and actions is also application-defined**. Your RLS policies can rely exclusively on roles, exclusively on actions, or combine both — and you control which check takes precedence:
+
+```sql
+-- Role-only: a tenant_admin may do anything on the tenant.
+USING (has_role_permission(..., role('tenant_admin'), ...))
+
+-- Action-only: access is gated on a fine-grained action check.
+USING (has_action_permission(..., action('read'), ...))
+
+-- Both: a role check is sufficient, but an explicit action grant also works.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR
+  has_action_permission(..., action('read'), ...)
+)
+
+-- Role overrides action: admins bypass the action check entirely.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR (
+    NOT has_role_permission(..., role('tenant_admin'), ...)
+    AND has_action_permission(..., action('read'), ...)
+  )
+)
+```
+
+The extension enforces no ordering or interaction between the two — that logic lives in your policies.
+
 ### Hierarchies
 
 Both principals and resources support a `parent_id` pointer for building trees:
