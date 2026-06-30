@@ -267,6 +267,12 @@ This is the order the engine evaluates candidates: it exhausts the full resource
 | `actions` | Named actions (e.g. `read`, `write`) |
 | `role_permissions` | Grants a role to a principal on a resource |
 | `action_permissions` | Grants or denies an action for a principal on a resource (`ALLOW` / `DENY`) |
+| `resource_closure` | Materialized ancestor/descendant pairs for the resource hierarchy |
+| `principal_closure` | Materialized ancestor/descendant pairs for the principal hierarchy |
+
+`resource_closure` and `principal_closure` are the performance foundation of the extension. Without them, resolving "does this resource inherit from that ancestor?" would require a recursive CTE or a loop — re-executing a query at each level of the hierarchy. With the closure tables, every ancestor-descendant pair is pre-written at insert/reparent time, so both `has_role_permission` and `has_action_permission` resolve the full hierarchy in a **single SQL statement with two index joins**, regardless of how deep the tree is.
+
+The cost is on writes: triggers maintain both tables whenever a node is inserted, reparented, or deleted. For authorization workloads — where a single page load may trigger dozens of RLS checks but hierarchies change rarely — this trade-off is strongly in favour of fast reads.
 
 ### Functions
 
@@ -439,6 +445,26 @@ WHERE principal_type = 'user' AND principal_uuid = '<user-uuid>';
 ```
 
 A role granted to the team is now automatically inherited by all its member users.
+
+---
+
+## Design philosophy
+
+This extension is intentionally narrow. It does not attempt to replicate cloud IAM systems (like AWS IAM) or distributed authorization engines (like Google Zanzibar). Those systems solve real problems — cross-service policy propagation, planet-scale consistency, attribute-based conditions — but they carry significant operational weight: separate infrastructure, network round-trips on every check, and policy languages with steep learning curves.
+
+**AWS IAM** is designed for controlling access to cloud infrastructure across dozens of independent services. It ships with a large set of primitives (policies, permission boundaries, SCPs, resource-based policies) that interact in non-obvious ways. Replicating that model inside a Postgres extension would introduce the same accidental complexity without the underlying cloud services that justify it.
+
+**Zanzibar** (and systems modelled on it, like SpiceDB or OpenFGA) materialises a global permission graph that can be queried at low latency regardless of data size. The trade-off is a separate service that must be kept in sync with your application database. Every write that affects permissions now has two targets; any drift between them is a correctness bug.
+
+This extension takes a different bet: **your Postgres database is already the source of truth, so keep authorization there too.** The entire permission graph lives in the same ACID transaction as your application data. A permission grant and the row it protects are written atomically, checked by the query planner, and backed up together. There is no sync gap.
+
+The scope is deliberately limited to what a relational database does well:
+
+- Hierarchical principals and resources, resolved at query time via materialized closure tables.
+- Role checks (`has_role_permission`) and allow/deny action checks (`has_action_permission`), callable directly from RLS policies.
+- No built-in policy language — semantics live in your SQL, which is already the language your team reads and reviews.
+
+If your application eventually outgrows a single Postgres cluster, or needs cross-service authorization that spans infrastructure outside the database, a dedicated authorization service becomes the right tool. Until then, the simpler system is usually the better one.
 
 ---
 
