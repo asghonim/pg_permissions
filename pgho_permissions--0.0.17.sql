@@ -15,6 +15,7 @@ BEGIN
     RETURN encode(uuid_bytes, 'hex')::uuid;
 END;
 $$ LANGUAGE plpgsql VOLATILE SET search_path = '';
+REVOKE EXECUTE ON FUNCTION @extschema@.gen_uuid_v7() FROM public;
 
 -- ---------------------------------------------------------------------------
 -- Resources
@@ -50,6 +51,82 @@ CREATE INDEX idx_principals_type_uuid ON @extschema@.principals(principal_type, 
 CREATE INDEX idx_principals_parent ON @extschema@.principals(parent_id) WHERE parent_id IS NOT NULL;
 ALTER TABLE @extschema@.principals ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE @extschema@.principals TO service_role;
+
+-- Cycle detection: walk from the proposed parent up through its ancestors;
+-- if we reach NEW.id the new parent_id would close a loop.
+CREATE OR REPLACE FUNCTION @extschema@.on_insert_resource()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+DECLARE
+    v_walk BIGINT;
+BEGIN
+    IF NEW.parent_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.parent_id = NEW.id THEN
+        RAISE EXCEPTION 'resource % cannot be its own parent', NEW.id;
+    END IF;
+
+    v_walk := NEW.parent_id;
+    WHILE v_walk IS NOT NULL LOOP
+        SELECT parent_id INTO v_walk
+        FROM @extschema@.resources
+        WHERE id = v_walk;
+
+        IF v_walk = NEW.id THEN
+            RAISE EXCEPTION
+                'setting parent_id = % on resource % would create a cycle in the resource hierarchy',
+                NEW.parent_id, NEW.id;
+        END IF;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_insert_resource
+    BEFORE INSERT OR UPDATE OF parent_id ON @extschema@.resources
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_insert_resource();
+
+CREATE OR REPLACE FUNCTION @extschema@.on_insert_principal()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = @extschema@
+AS $$
+DECLARE
+    v_walk BIGINT;
+BEGIN
+    IF NEW.parent_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.parent_id = NEW.id THEN
+        RAISE EXCEPTION 'principal % cannot be its own parent', NEW.id;
+    END IF;
+
+    v_walk := NEW.parent_id;
+    WHILE v_walk IS NOT NULL LOOP
+        SELECT parent_id INTO v_walk
+        FROM @extschema@.principals
+        WHERE id = v_walk;
+
+        IF v_walk = NEW.id THEN
+            RAISE EXCEPTION
+                'setting parent_id = % on principal % would create a cycle in the principal hierarchy',
+                NEW.parent_id, NEW.id;
+        END IF;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_insert_principal
+    BEFORE INSERT OR UPDATE OF parent_id ON @extschema@.principals
+    FOR EACH ROW EXECUTE FUNCTION @extschema@.on_insert_principal();
 
 CREATE TABLE @extschema@.roles (
     id               BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -115,6 +192,7 @@ CREATE OR REPLACE FUNCTION @extschema@.principal(p_principal_type TEXT, p_princi
       RETURN (SELECT id FROM @extschema@.principals WHERE principal_type = p_principal_type AND principal_uuid = p_principal_uuid LIMIT 1);
   END;
   $$;
+  REVOKE EXECUTE ON FUNCTION @extschema@.principal(TEXT, UUID) FROM public;
 
 CREATE OR REPLACE FUNCTION @extschema@.role(p_role_name TEXT)
   RETURNS BIGINT
@@ -125,6 +203,8 @@ CREATE OR REPLACE FUNCTION @extschema@.role(p_role_name TEXT)
       RETURN (SELECT id FROM @extschema@.roles WHERE role_name = p_role_name LIMIT 1);
   END;
   $$;
+  REVOKE EXECUTE ON FUNCTION @extschema@.role(TEXT) FROM public;
+
 
 CREATE OR REPLACE FUNCTION @extschema@.resource(p_resource_type TEXT, p_resource_uuid UUID)
   RETURNS BIGINT
@@ -135,6 +215,8 @@ CREATE OR REPLACE FUNCTION @extschema@.resource(p_resource_type TEXT, p_resource
       RETURN (SELECT id FROM @extschema@.resources WHERE resource_type = p_resource_type AND resource_uuid = p_resource_uuid LIMIT 1);
   END;
   $$;
+  REVOKE EXECUTE ON FUNCTION @extschema@.resource(TEXT, UUID) FROM public;
+
 
 CREATE OR REPLACE FUNCTION @extschema@.action(p_action_name TEXT)
   RETURNS BIGINT
@@ -145,6 +227,8 @@ CREATE OR REPLACE FUNCTION @extschema@.action(p_action_name TEXT)
       RETURN (SELECT id FROM @extschema@.actions WHERE action_name = p_action_name LIMIT 1);
   END;
   $$;
+  REVOKE EXECUTE ON FUNCTION @extschema@.action(TEXT) FROM public;
+
 
 CREATE OR REPLACE FUNCTION @extschema@.has_action_permission(
     p_principal_id BIGINT,
@@ -263,6 +347,10 @@ CREATE OR REPLACE FUNCTION @extschema@.has_role_permission(
   END;
   $$;
 
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ FROM public;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA @extschema@ FROM public;
+REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA @extschema@ FROM public;
+REVOKE ALL PRIVILEGES ON SCHEMA @extschema@ FROM public;
 GRANT USAGE, CREATE ON SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA @extschema@ TO service_role;
