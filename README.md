@@ -6,70 +6,6 @@ Built with Supabase in mind: all tables have RLS enabled, lookup functions run a
 
 ---
 
-## Concepts
-
-| Concept | What it represents | Example |
-| --- | --- | --- |
-| **Principal** | An actor that can hold permissions | `user`, `team`, `service_account` |
-| **Resource** | A thing being protected | `tenant`, `project`, `document` |
-| **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
-| **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
-
-### Hierarchies
-
-Both principals and resources support a `parent_id` pointer for building trees:
-
-```text
-Organization (principal)
-  └── Team (principal)
-        └── User (principal)
-
-Workspace (resource)
-  └── Project (resource)
-        └── Document (resource)
-```
-
-When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children. The **first matching rule wins**; if no rule is found anywhere, the result is **DENY**.
-
----
-
-## Architecture
-
-### Tables
-
-| Table | Purpose |
-| --- | --- |
-| `resources` | Registry of every protected object |
-| `principals` | Registry of every actor |
-| `roles` | Named roles (e.g. `admin`, `viewer`) |
-| `actions` | Named actions (e.g. `read`, `write`) |
-| `role_permissions` | Grants a role to a principal on a resource |
-| `action_permissions` | Grants or denies an action for a principal on a resource (`ALLOW` / `DENY`) |
-
-### Functions
-
-| Function | Returns | Description |
-| --- | --- | --- |
-| `principal(type, uuid)` | `BIGINT` | Looks up a principal's internal ID |
-| `resource(type, uuid)` | `BIGINT` | Looks up a resource's internal ID |
-| `role(name)` | `BIGINT` | Looks up a role's internal ID |
-| `action(name)` | `BIGINT` | Looks up an action's internal ID |
-| `has_role_permission(principal_id, role_id, resource_id)` | `BOOLEAN` | Checks if a principal holds a role on a resource (walks both hierarchies) |
-| `has_action_permission(principal_id, action_id, resource_id)` | `BOOLEAN` | Checks if a principal is allowed an action on a resource (walks both hierarchies) |
-
-### Permission resolution
-
-Both `has_role_permission` and `has_action_permission` use the same two-level walk:
-
-1. Start at the given principal; start at the given resource.
-2. Look for a matching rule at (current principal, current resource).
-3. If found → return its result immediately.
-4. If not found → move one level up the **resource** hierarchy and repeat from step 2.
-5. Once the resource hierarchy is exhausted → move one level up the **principal** hierarchy and restart the resource walk from step 2.
-6. If the entire search space is exhausted → return `FALSE` (default deny).
-
----
-
 ## Installation
 
 Install via [database.dev](https://database.dev) (requires the `dbdev` utility):
@@ -84,7 +20,7 @@ DROP SCHEMA     IF EXISTS pgho_permissions;
 CREATE SCHEMA   IF NOT EXISTS pgho_permissions;
 CREATE EXTENSION IF NOT EXISTS "asghonim@pgho_permissions"
   SCHEMA pgho_permissions
-  VERSION '0.0.17';
+  VERSION '0.0.18';
 ```
 
 You can substitute any schema name you prefer for `pgho_permissions`.
@@ -217,6 +153,232 @@ GRANT SELECT ON public.documents TO authenticated;
 
 ---
 
+## Concepts
+
+| Concept | What it represents | Example |
+| --- | --- | --- |
+| **Principal** | An actor that can hold permissions | `user`, `team`, `service_account` |
+| **Resource** | A thing being protected | `tenant`, `project`, `document` |
+| **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
+| **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
+
+This diagram shows how the core tables relate to one another and how self-referencing foreign keys (parent_id) build the hierarchical trees for both principals and resources.
+
+```
+                   +-----------------------+
+                   |       principals      |
+                   +-----------------------+
+                   | PK | id               | <----+
+                   |    | principal_type   |      | parent_id
+                   |    | principal_uuid   | -----+
+                   | FK | parent_id        |
+                   +-----------------------+
+                     ^                   ^
+                     |                   |
+                     | principal_id      | principal_id
+                     |                   |
+    +-----------------------+     +---------------------------+
+    |    role_permissions   |     |    action_permissions     |
+    +-----------------------+     +---------------------------+
+    | PK | id               |     | PK | id                   |
+    | FK | principal_id     |     | FK | principal_id         |
+    | FK | role_id          |     | FK | action_id            |
+    | FK | resource_id      |     | FK | resource_id          |
+    +-----------------------+     |    | access (ALLOW/DENY)  |
+      |                   |       +---------------------------+
+      |                   |          |                    |
+      | role_id           |          | action_id          |
+      v                   |          v                    |
++------------+            |    +------------+             | resource_id
+|   roles    |            |    |  actions   |             |
++------------+            |    +------------+             |
+| PK | id    |            |    | PK | id    |             |
+|    | role_name  |       |    |    | action_name  |        |
++------------+            |    +------------+             |
+                          |                               v
+                          |                   +-----------------------+
+                          |                   |       resources       |
+                          |                   +-----------------------+
+                          |                   | PK | id               | <----+
+                          +-----------------> |    | resource_type   |      | parent_id
+                                              |    | resource_uuid   | -----+
+                                              | FK | parent_id        |
+                                              +-----------------------+
+```
+
+When has_role_permission or has_action_permission is invoked, the engine executes a nested tree-walk. It searches the resource tree first for the current principal before stepping up to the parent principal. This is a simplified diagram of the search process. The actual implementation is a single SQL query with two index joins, but the logic is easier to visualize as a flowchart:
+
+```
+             [ Start Search ]
+       (Current Principal = Input Principal)
+                 |
+                 v
+     +---> [ Reset Resource Walk ] <--------------------------+
+     |     (Current Resource = Input Resource)                |
+     |           |                                            |
+     |           v                                            |
+     |     Is there a rule matching                           |
+     |   (Current Principal, Current Resource)?               |
+     |         /           \                                  |
+     |       YES            NO                                |
+     |       /               \                                |
+     |      v                 v                               |
+     |  [ RETURN RULE ]     Does Current Resource             |
+     |  (ALLOW or DENY)     have a parent_id?                 |
+     |                        /           \                   |
+     |                      YES            NO                 |
+     |                      /               \                 |
+     |                     v                 v                |
+     |             [ Move Up Resource ]    Does Current       |
+     |             Current Resource =      Principal have     |
+     |             resource.parent_id      a parent_id?       |
+     |                     |                 /          \     |
+     |                     +--> (Loop)     YES           NO   |
+     |                                     /              \   |
+     |                                    v                v  |
+     |                             [ Move Up Principal ] [ RETURN FALSE ]
+     |                             Current Principal =    (Default Deny)
+     |                             principal.parent_id
+     |                                    |
+     +------------------------------------+
+```
+
+### Roles and actions are opaque
+
+The extension treats roles and actions as **plain names**. A role has no intrinsic meaning beyond its string identifier — the extension does not know what `tenant_admin` implies, whether roles subsume actions, or whether one role outranks another. The same is true for actions: `delete` is just a label.
+
+All semantics are **application-defined**. Your RLS policies are the place where meaning is assigned:
+
+```sql
+-- The application decides that holding "tenant_admin" means you may SELECT tenants.
+CREATE POLICY "SELECT tenants"
+  ON public.tenants FOR SELECT
+  USING (
+    pgho_permissions.has_role_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.role('tenant_admin'),
+      pgho_permissions.resource('tenant', uid)
+    )
+  );
+
+-- The application decides that holding "write" access to a document means you may UPDATE it.
+CREATE POLICY "UPDATE documents"
+  ON public.documents FOR UPDATE
+  USING (
+    pgho_permissions.has_action_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.action('write'),
+      pgho_permissions.resource('document', uid)
+    )
+  );
+```
+
+Whether a role implies certain actions, whether roles and actions coexist on the same resource, and how types like `user` or `tenant` map to your schema — all of that is up to you. The extension only answers "does this principal hold this role/action on this resource (or an ancestor)?"
+
+The **relationship between roles and actions is also application-defined**. Your RLS policies can rely exclusively on roles, exclusively on actions, or combine both — and you control which check takes precedence:
+
+```sql
+-- Role-only: a tenant_admin may do anything on the tenant.
+USING (has_role_permission(..., role('tenant_admin'), ...))
+
+-- Action-only: access is gated on a fine-grained action check.
+USING (has_action_permission(..., action('read'), ...))
+
+-- Both: a role check is sufficient, but an explicit action grant also works.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR
+  has_action_permission(..., action('read'), ...)
+)
+
+-- Role overrides action: admins bypass the action check entirely.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR (
+    NOT has_role_permission(..., role('tenant_admin'), ...)
+    AND has_action_permission(..., action('read'), ...)
+  )
+)
+```
+
+The extension enforces no ordering or interaction between the two — that logic lives in your policies.
+
+### Hierarchies
+
+Both principals and resources support a `parent_id` pointer for building trees:
+
+```text
+Organization (principal)
+  └── Team (principal)
+        └── User (principal)
+
+Workspace (resource)
+  └── Project (resource)
+        └── Document (resource)
+```
+
+When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children.
+
+**Precedence** is determined first by principal specificity, then by resource specificity. A permission attached to a more specific principal always overrides one attached to an ancestor principal, regardless of resource specificity. Within the same principal, the most specific resource wins. If no rule is found anywhere, the result is **DENY**.
+
+| Priority | Principal | Resource |
+| --- | --- | --- |
+| 1 | Exact | Exact |
+| 2 | Exact | Parent |
+| 3 | Exact | Grandparent … |
+| 4 | Parent | Exact |
+| 5 | Parent | Parent |
+| 6 | Parent | Grandparent … |
+| 7 | Grandparent | Exact |
+| … | … | … |
+
+This is the order the engine evaluates candidates: it exhausts the full resource hierarchy for the current principal before moving one level up the principal hierarchy.
+
+---
+
+## Architecture
+
+### Tables
+
+| Table | Purpose |
+| --- | --- |
+| `resources` | Registry of every protected object |
+| `principals` | Registry of every actor |
+| `roles` | Named roles (e.g. `admin`, `viewer`) |
+| `actions` | Named actions (e.g. `read`, `write`) |
+| `role_permissions` | Grants a role to a principal on a resource |
+| `action_permissions` | Grants or denies an action for a principal on a resource (`ALLOW` / `DENY`) |
+| `resource_closure` | Materialized ancestor/descendant pairs for the resource hierarchy |
+| `principal_closure` | Materialized ancestor/descendant pairs for the principal hierarchy |
+
+`resource_closure` and `principal_closure` are the performance foundation of the extension. Without them, resolving "does this resource inherit from that ancestor?" would require a recursive CTE or a loop — re-executing a query at each level of the hierarchy. With the closure tables, every ancestor-descendant pair is pre-written at insert/reparent time, so both `has_role_permission` and `has_action_permission` resolve the full hierarchy in a **single SQL statement with two index joins**, regardless of how deep the tree is.
+
+The cost is on writes: triggers maintain both tables whenever a node is inserted, reparented, or deleted. For authorization workloads — where a single page load may trigger dozens of RLS checks but hierarchies change rarely — this trade-off is strongly in favour of fast reads.
+
+### Functions
+
+| Function | Returns | Description |
+| --- | --- | --- |
+| `principal(type, uuid)` | `BIGINT` | Looks up a principal's internal ID |
+| `resource(type, uuid)` | `BIGINT` | Looks up a resource's internal ID |
+| `role(name)` | `BIGINT` | Looks up a role's internal ID |
+| `action(name)` | `BIGINT` | Looks up an action's internal ID |
+| `has_role_permission(principal_id, role_id, resource_id)` | `BOOLEAN` | Checks if a principal holds a role on a resource (walks both hierarchies) |
+| `has_action_permission(principal_id, action_id, resource_id)` | `BOOLEAN` | Checks if a principal is allowed an action on a resource (walks both hierarchies) |
+
+### Permission resolution
+
+Both `has_role_permission` and `has_action_permission` use the same two-level walk:
+
+1. Start at the given principal; start at the given resource.
+2. Look for a matching rule at (current principal, current resource).
+3. If found → return its result immediately.
+4. If not found → move one level up the **resource** hierarchy and repeat from step 2.
+5. Once the resource hierarchy is exhausted → move one level up the **principal** hierarchy and restart the resource walk from step 2.
+6. If the entire search space is exhausted → return `FALSE` (default deny).
+
+---
+
 ## Common patterns
 
 ### Multi-tenant SaaS
@@ -258,6 +420,92 @@ VALUES (
 
 A permission granted on the org now automatically covers all projects and documents beneath it — no extra rows needed.
 
+### Granting permissions across all resources (root resource)
+
+Suppose you want to give an admin `OWNER` on *every* resource — across every tenant, project, and document — without touching each row individually.
+
+The idiomatic solution is to make every resource hierarchy rooted at a single synthetic **root resource**. The root is a normal row in `resources`; it just has no `parent_id` and no corresponding domain object.
+
+```sql
+-- Create the root resource once (pick a stable UUID and reuse it everywhere)
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('root', '00000000-0000-0000-0000-000000000000', NULL);
+```
+
+Every other top-level resource then becomes a child of root:
+
+```sql
+-- Tenant A hangs off the root
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('tenant', '<tenant-a-uuid>', pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000'));
+```
+
+This gives you a single tree that looks like:
+
+```text
+root
+├── Tenant A
+│   ├── Project 1
+│   │   └── Document 1
+│   └── Project 2
+└── Tenant B
+    └── Project 3
+```
+
+To grant a principal `OWNER` everywhere:
+
+```sql
+INSERT INTO pgho_permissions.role_permissions (principal_id, role_id, resource_id)
+VALUES (
+    pgho_permissions.principal('user',  '<admin-uuid>'),
+    pgho_permissions.role('owner'),
+    pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000')
+);
+```
+
+No special code. The hierarchy walk already climbs from any document → project → tenant → root, so the rule is found naturally.
+
+#### How the walk reaches it
+
+`has_role_permission(Bob, OWNER, Document 1)` walks:
+
+```text
+Document 1 → Project 1 → Tenant A → root   ← rule found here
+```
+
+Exactly as today. Nothing changes.
+
+#### Category roots (scoped global grants)
+
+You can introduce intermediate synthetic roots to scope a global grant to one resource type without affecting others:
+
+```sql
+-- A synthetic node that groups all projects (pick a stable UUID for each synthetic root)
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('projects_root', '00000000-0000-0000-0000-000000000001', pgho_permissions.resource('root', '00000000-0000-0000-0000-000000000000'));
+
+-- All projects hang off it
+UPDATE pgho_permissions.resources
+SET parent_id = pgho_permissions.resource('projects_root', '00000000-0000-0000-0000-000000000001')
+WHERE resource_type = 'project';
+```
+
+Now `EDITOR` on `projects_root` covers every project but not tenants, invoices, or anything else.
+
+#### Multiple independent trees
+
+If your application has resource types that are unrelated (tenants, invoices, products), introduce one shared root and attach each unrelated tree to it:
+
+```text
+root
+├── Tenants
+├── Invoices
+├── Products
+└── Reports
+```
+
+Every top-level resource attaches somewhere, and a single grant on root still reaches all of them via the ordinary ancestor walk.
+
 ### Group / team membership
 
 Create teams as principals with `parent_id` pointing to the org principal, then add users as children of the team:
@@ -278,6 +526,26 @@ WHERE principal_type = 'user' AND principal_uuid = '<user-uuid>';
 ```
 
 A role granted to the team is now automatically inherited by all its member users.
+
+---
+
+## Design philosophy
+
+This extension is intentionally narrow. It does not attempt to replicate cloud IAM systems (like AWS IAM) or distributed authorization engines (like Google Zanzibar). Those systems solve real problems — cross-service policy propagation, planet-scale consistency, attribute-based conditions — but they carry significant operational weight: separate infrastructure, network round-trips on every check, and policy languages with steep learning curves.
+
+**AWS IAM** is designed for controlling access to cloud infrastructure across dozens of independent services. It ships with a large set of primitives (policies, permission boundaries, SCPs, resource-based policies) that interact in non-obvious ways. Replicating that model inside a Postgres extension would introduce the same accidental complexity without the underlying cloud services that justify it.
+
+**Zanzibar** (and systems modelled on it, like SpiceDB or OpenFGA) materialises a global permission graph that can be queried at low latency regardless of data size. The trade-off is a separate service that must be kept in sync with your application database. Every write that affects permissions now has two targets; any drift between them is a correctness bug.
+
+This extension takes a different bet: **your Postgres database is already the source of truth, so keep authorization there too.** The entire permission graph lives in the same ACID transaction as your application data. A permission grant and the row it protects are written atomically, checked by the query planner, and backed up together. There is no sync gap.
+
+The scope is deliberately limited to what a relational database does well:
+
+- Hierarchical principals and resources, resolved at query time via materialized closure tables.
+- Role checks (`has_role_permission`) and allow/deny action checks (`has_action_permission`), callable directly from RLS policies.
+- No built-in policy language — semantics live in your SQL, which is already the language your team reads and reviews.
+
+If your application eventually outgrows a single Postgres cluster, or needs cross-service authorization that spans infrastructure outside the database, a dedicated authorization service becomes the right tool. Until then, the simpler system is usually the better one.
 
 ---
 
