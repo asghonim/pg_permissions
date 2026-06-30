@@ -6,145 +6,6 @@ Built with Supabase in mind: all tables have RLS enabled, lookup functions run a
 
 ---
 
-## Concepts
-
-| Concept | What it represents | Example |
-| --- | --- | --- |
-| **Principal** | An actor that can hold permissions | `user`, `team`, `service_account` |
-| **Resource** | A thing being protected | `tenant`, `project`, `document` |
-| **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
-| **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
-
-### Roles and actions are opaque
-
-The extension treats roles and actions as **plain names**. A role has no intrinsic meaning beyond its string identifier — the extension does not know what `tenant_admin` implies, whether roles subsume actions, or whether one role outranks another. The same is true for actions: `delete` is just a label.
-
-All semantics are **application-defined**. Your RLS policies are the place where meaning is assigned:
-
-```sql
--- The application decides that holding "tenant_admin" means you may SELECT tenants.
-CREATE POLICY "SELECT tenants"
-  ON public.tenants FOR SELECT
-  USING (
-    pgho_permissions.has_role_permission(
-      pgho_permissions.principal('user', auth.uid()),
-      pgho_permissions.role('tenant_admin'),
-      pgho_permissions.resource('tenant', uid)
-    )
-  );
-
--- The application decides that holding "write" access to a document means you may UPDATE it.
-CREATE POLICY "UPDATE documents"
-  ON public.documents FOR UPDATE
-  USING (
-    pgho_permissions.has_action_permission(
-      pgho_permissions.principal('user', auth.uid()),
-      pgho_permissions.action('write'),
-      pgho_permissions.resource('document', uid)
-    )
-  );
-```
-
-Whether a role implies certain actions, whether roles and actions coexist on the same resource, and how types like `user` or `tenant` map to your schema — all of that is up to you. The extension only answers "does this principal hold this role/action on this resource (or an ancestor)?"
-
-The **relationship between roles and actions is also application-defined**. Your RLS policies can rely exclusively on roles, exclusively on actions, or combine both — and you control which check takes precedence:
-
-```sql
--- Role-only: a tenant_admin may do anything on the tenant.
-USING (has_role_permission(..., role('tenant_admin'), ...))
-
--- Action-only: access is gated on a fine-grained action check.
-USING (has_action_permission(..., action('read'), ...))
-
--- Both: a role check is sufficient, but an explicit action grant also works.
-USING (
-  has_role_permission(..., role('tenant_admin'), ...)
-  OR
-  has_action_permission(..., action('read'), ...)
-)
-
--- Role overrides action: admins bypass the action check entirely.
-USING (
-  has_role_permission(..., role('tenant_admin'), ...)
-  OR (
-    NOT has_role_permission(..., role('tenant_admin'), ...)
-    AND has_action_permission(..., action('read'), ...)
-  )
-)
-```
-
-The extension enforces no ordering or interaction between the two — that logic lives in your policies.
-
-### Hierarchies
-
-Both principals and resources support a `parent_id` pointer for building trees:
-
-```text
-Organization (principal)
-  └── Team (principal)
-        └── User (principal)
-
-Workspace (resource)
-  └── Project (resource)
-        └── Document (resource)
-```
-
-When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children.
-
-**Precedence** is determined first by principal specificity, then by resource specificity. A permission attached to a more specific principal always overrides one attached to an ancestor principal, regardless of resource specificity. Within the same principal, the most specific resource wins. If no rule is found anywhere, the result is **DENY**.
-
-| Priority | Principal | Resource |
-| --- | --- | --- |
-| 1 | Exact | Exact |
-| 2 | Exact | Parent |
-| 3 | Exact | Grandparent … |
-| 4 | Parent | Exact |
-| 5 | Parent | Parent |
-| 6 | Parent | Grandparent … |
-| 7 | Grandparent | Exact |
-| … | … | … |
-
-This is the order the engine evaluates candidates: it exhausts the full resource hierarchy for the current principal before moving one level up the principal hierarchy.
-
----
-
-## Architecture
-
-### Tables
-
-| Table | Purpose |
-| --- | --- |
-| `resources` | Registry of every protected object |
-| `principals` | Registry of every actor |
-| `roles` | Named roles (e.g. `admin`, `viewer`) |
-| `actions` | Named actions (e.g. `read`, `write`) |
-| `role_permissions` | Grants a role to a principal on a resource |
-| `action_permissions` | Grants or denies an action for a principal on a resource (`ALLOW` / `DENY`) |
-
-### Functions
-
-| Function | Returns | Description |
-| --- | --- | --- |
-| `principal(type, uuid)` | `BIGINT` | Looks up a principal's internal ID |
-| `resource(type, uuid)` | `BIGINT` | Looks up a resource's internal ID |
-| `role(name)` | `BIGINT` | Looks up a role's internal ID |
-| `action(name)` | `BIGINT` | Looks up an action's internal ID |
-| `has_role_permission(principal_id, role_id, resource_id)` | `BOOLEAN` | Checks if a principal holds a role on a resource (walks both hierarchies) |
-| `has_action_permission(principal_id, action_id, resource_id)` | `BOOLEAN` | Checks if a principal is allowed an action on a resource (walks both hierarchies) |
-
-### Permission resolution
-
-Both `has_role_permission` and `has_action_permission` use the same two-level walk:
-
-1. Start at the given principal; start at the given resource.
-2. Look for a matching rule at (current principal, current resource).
-3. If found → return its result immediately.
-4. If not found → move one level up the **resource** hierarchy and repeat from step 2.
-5. Once the resource hierarchy is exhausted → move one level up the **principal** hierarchy and restart the resource walk from step 2.
-6. If the entire search space is exhausted → return `FALSE` (default deny).
-
----
-
 ## Installation
 
 Install via [database.dev](https://database.dev) (requires the `dbdev` utility):
@@ -289,6 +150,145 @@ CREATE POLICY "SELECT documents"
   );
 GRANT SELECT ON public.documents TO authenticated;
 ```
+
+---
+
+## Concepts
+
+| Concept | What it represents | Example |
+| --- | --- | --- |
+| **Principal** | An actor that can hold permissions | `user`, `team`, `service_account` |
+| **Resource** | A thing being protected | `tenant`, `project`, `document` |
+| **Role** | A named capability assigned to a principal on a resource | `tenant_admin`, `viewer` |
+| **Action** | A fine-grained operation that can be explicitly allowed or denied | `read`, `write`, `delete` |
+
+### Roles and actions are opaque
+
+The extension treats roles and actions as **plain names**. A role has no intrinsic meaning beyond its string identifier — the extension does not know what `tenant_admin` implies, whether roles subsume actions, or whether one role outranks another. The same is true for actions: `delete` is just a label.
+
+All semantics are **application-defined**. Your RLS policies are the place where meaning is assigned:
+
+```sql
+-- The application decides that holding "tenant_admin" means you may SELECT tenants.
+CREATE POLICY "SELECT tenants"
+  ON public.tenants FOR SELECT
+  USING (
+    pgho_permissions.has_role_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.role('tenant_admin'),
+      pgho_permissions.resource('tenant', uid)
+    )
+  );
+
+-- The application decides that holding "write" access to a document means you may UPDATE it.
+CREATE POLICY "UPDATE documents"
+  ON public.documents FOR UPDATE
+  USING (
+    pgho_permissions.has_action_permission(
+      pgho_permissions.principal('user', auth.uid()),
+      pgho_permissions.action('write'),
+      pgho_permissions.resource('document', uid)
+    )
+  );
+```
+
+Whether a role implies certain actions, whether roles and actions coexist on the same resource, and how types like `user` or `tenant` map to your schema — all of that is up to you. The extension only answers "does this principal hold this role/action on this resource (or an ancestor)?"
+
+The **relationship between roles and actions is also application-defined**. Your RLS policies can rely exclusively on roles, exclusively on actions, or combine both — and you control which check takes precedence:
+
+```sql
+-- Role-only: a tenant_admin may do anything on the tenant.
+USING (has_role_permission(..., role('tenant_admin'), ...))
+
+-- Action-only: access is gated on a fine-grained action check.
+USING (has_action_permission(..., action('read'), ...))
+
+-- Both: a role check is sufficient, but an explicit action grant also works.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR
+  has_action_permission(..., action('read'), ...)
+)
+
+-- Role overrides action: admins bypass the action check entirely.
+USING (
+  has_role_permission(..., role('tenant_admin'), ...)
+  OR (
+    NOT has_role_permission(..., role('tenant_admin'), ...)
+    AND has_action_permission(..., action('read'), ...)
+  )
+)
+```
+
+The extension enforces no ordering or interaction between the two — that logic lives in your policies.
+
+### Hierarchies
+
+Both principals and resources support a `parent_id` pointer for building trees:
+
+```text
+Organization (principal)
+  └── Team (principal)
+        └── User (principal)
+
+Workspace (resource)
+  └── Project (resource)
+        └── Document (resource)
+```
+
+When checking a permission, the engine walks **up** both hierarchies. A rule defined on a parent resource or a parent principal is inherited by all children.
+
+**Precedence** is determined first by principal specificity, then by resource specificity. A permission attached to a more specific principal always overrides one attached to an ancestor principal, regardless of resource specificity. Within the same principal, the most specific resource wins. If no rule is found anywhere, the result is **DENY**.
+
+| Priority | Principal | Resource |
+| --- | --- | --- |
+| 1 | Exact | Exact |
+| 2 | Exact | Parent |
+| 3 | Exact | Grandparent … |
+| 4 | Parent | Exact |
+| 5 | Parent | Parent |
+| 6 | Parent | Grandparent … |
+| 7 | Grandparent | Exact |
+| … | … | … |
+
+This is the order the engine evaluates candidates: it exhausts the full resource hierarchy for the current principal before moving one level up the principal hierarchy.
+
+---
+
+## Architecture
+
+### Tables
+
+| Table | Purpose |
+| --- | --- |
+| `resources` | Registry of every protected object |
+| `principals` | Registry of every actor |
+| `roles` | Named roles (e.g. `admin`, `viewer`) |
+| `actions` | Named actions (e.g. `read`, `write`) |
+| `role_permissions` | Grants a role to a principal on a resource |
+| `action_permissions` | Grants or denies an action for a principal on a resource (`ALLOW` / `DENY`) |
+
+### Functions
+
+| Function | Returns | Description |
+| --- | --- | --- |
+| `principal(type, uuid)` | `BIGINT` | Looks up a principal's internal ID |
+| `resource(type, uuid)` | `BIGINT` | Looks up a resource's internal ID |
+| `role(name)` | `BIGINT` | Looks up a role's internal ID |
+| `action(name)` | `BIGINT` | Looks up an action's internal ID |
+| `has_role_permission(principal_id, role_id, resource_id)` | `BOOLEAN` | Checks if a principal holds a role on a resource (walks both hierarchies) |
+| `has_action_permission(principal_id, action_id, resource_id)` | `BOOLEAN` | Checks if a principal is allowed an action on a resource (walks both hierarchies) |
+
+### Permission resolution
+
+Both `has_role_permission` and `has_action_permission` use the same two-level walk:
+
+1. Start at the given principal; start at the given resource.
+2. Look for a matching rule at (current principal, current resource).
+3. If found → return its result immediately.
+4. If not found → move one level up the **resource** hierarchy and repeat from step 2.
+5. Once the resource hierarchy is exhausted → move one level up the **principal** hierarchy and restart the resource walk from step 2.
+6. If the entire search space is exhausted → return `FALSE` (default deny).
 
 ---
 
