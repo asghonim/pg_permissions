@@ -471,6 +471,16 @@ REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ FROM public;
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA @extschema@ FROM public;
 REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA @extschema@ FROM public;
 REVOKE ALL PRIVILEGES ON SCHEMA @extschema@ FROM public;
+
+-- Allow application roles to call the SECURITY DEFINER API from RLS policies
+GRANT USAGE ON SCHEMA @extschema@ TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.principal(TEXT, UUID) TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.resource(TEXT, UUID) TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.role(TEXT) TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.action(TEXT) TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.has_role_permission(BIGINT, BIGINT, BIGINT) TO public;
+GRANT EXECUTE ON FUNCTION @extschema@.has_action_permission(BIGINT, BIGINT, BIGINT) TO public;
+
 GRANT USAGE, CREATE ON SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA @extschema@ TO service_role;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA @extschema@ TO service_role;
