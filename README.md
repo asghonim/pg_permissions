@@ -333,6 +333,92 @@ VALUES (
 
 A permission granted on the org now automatically covers all projects and documents beneath it — no extra rows needed.
 
+### Granting permissions across all resources (root resource)
+
+Suppose you want to give an admin `OWNER` on *every* resource — across every tenant, project, and document — without touching each row individually.
+
+The idiomatic solution is to make every resource hierarchy rooted at a single synthetic **root resource**. The root is a normal row in `resources`; it just has no `parent_id` and no corresponding domain object.
+
+```sql
+-- Create the root resource once (no resource_uuid needed)
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('root', NULL, NULL);
+```
+
+Every other top-level resource then becomes a child of root:
+
+```sql
+-- Tenant A hangs off the root
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('tenant', '<tenant-a-uuid>', pgho_permissions.resource('root', NULL));
+```
+
+This gives you a single tree that looks like:
+
+```text
+root
+├── Tenant A
+│   ├── Project 1
+│   │   └── Document 1
+│   └── Project 2
+└── Tenant B
+    └── Project 3
+```
+
+To grant a principal `OWNER` everywhere:
+
+```sql
+INSERT INTO pgho_permissions.role_permissions (principal_id, role_id, resource_id)
+VALUES (
+    pgho_permissions.principal('user',  '<admin-uuid>'),
+    pgho_permissions.role('owner'),
+    pgho_permissions.resource('root', NULL)
+);
+```
+
+No special code. The hierarchy walk already climbs from any document → project → tenant → root, so the rule is found naturally.
+
+#### How the walk reaches it
+
+`has_role_permission(Bob, OWNER, Document 1)` walks:
+
+```text
+Document 1 → Project 1 → Tenant A → root   ← rule found here
+```
+
+Exactly as today. Nothing changes.
+
+#### Category roots (scoped global grants)
+
+You can introduce intermediate synthetic roots to scope a global grant to one resource type without affecting others:
+
+```sql
+-- A synthetic node that groups all projects
+INSERT INTO pgho_permissions.resources (resource_type, resource_uuid, parent_id)
+VALUES ('projects_root', NULL, pgho_permissions.resource('root', NULL));
+
+-- All projects hang off it
+UPDATE pgho_permissions.resources
+SET parent_id = pgho_permissions.resource('projects_root', NULL)
+WHERE resource_type = 'project';
+```
+
+Now `EDITOR` on `projects_root` covers every project but not tenants, invoices, or anything else.
+
+#### Multiple independent trees
+
+If your application has resource types that are unrelated (tenants, invoices, products), introduce one shared root and attach each unrelated tree to it:
+
+```text
+root
+├── Tenants
+├── Invoices
+├── Products
+└── Reports
+```
+
+Every top-level resource attaches somewhere, and a single grant on root still reaches all of them via the ordinary ancestor walk.
+
 ### Group / team membership
 
 Create teams as principals with `parent_id` pointing to the org principal, then add users as children of the team:
